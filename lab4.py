@@ -4,6 +4,8 @@ import threading
 import socket
 import time
 import uuid
+import datetime
+from datetime import timezone
 import struct
 # https://bluesock.org/~willkg/dev/ansi.html
 ANSI_RESET = "\u001B[0m"
@@ -40,10 +42,10 @@ def get_node_uuid():
 
 
 class NeighborInfo(object):
-    def __init__(self, delay, last_timestamp, ip=None, tcp_port=None):
+    def __init__(self, delay, broadcast_count, ip=None, tcp_port=None):
         # Ip and port are optional, if you want to store them.
         self.delay = delay
-        self.last_timestamp = last_timestamp
+        self.broadcast_count = broadcast_count
         self.ip = ip
         self.tcp_port = tcp_port
 
@@ -62,13 +64,44 @@ server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
 # Leave broadcaster as a global variable.
 broadcaster = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 # Setup the UDP socket
+broadcaster.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+broadcaster.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+broadcaster.bind(("", get_broadcast_port()))
+
+
+def get_timestamp():
+    dt = datetime.datetime.now()
+    utc = dt.replace(tzinfo=timezone.utc)
+    return utc.timestamp()
+
+
+def print_neighbours():
+    for node, data in neighbor_information.items():
+        print(f"Node: {node}  Port: {data.tcp_port}  Delay: {data.delay} ms")
+
+
+# def refresh_neighbours():
+#     threads = []
+#     for node in neighbor_information.keys():
+#         ip = neighbor_information[node].ip
+#         port = neighbor_information[node].tcp_port
+#         threads.append(daemon_thread_builder(exchange_timestamps_thread, args=(node, ip, port)))
+#         threads[-1].start()
+#     for thread in threads:
+#         thread.join()
+#     print_neighbours()
 
 
 def send_broadcast_thread():
+
     node_uuid = get_node_uuid()
+    message = " ".join([node_uuid, "ON", str(server.getsockname()[1])])
+    print("Message to be broadcast: " + message)
+    message = message.encode("UTF-8")
     while True:
         # TODO: write logic for sending broadcasts.
-        time.sleep(1)   # Leave as is.
+        broadcaster.sendto(message, ('<broadcast>', get_broadcast_port()))
+        time.sleep(1)  # Leave as is.
 
 
 def receive_broadcast_thread():
@@ -80,7 +113,21 @@ def receive_broadcast_thread():
     while True:
         # TODO: write logic for receiving broadcasts.
         data, (ip, port) = broadcaster.recvfrom(4096)
+        data = data.decode("UTF-8")
+        node, _, port = data.split(" ")
         print_blue(f"RECV: {data} FROM: {ip}:{port}")
+        if node != get_node_uuid():
+            if node not in neighbor_information.keys():
+                timestamp_thread = daemon_thread_builder(target=exchange_timestamps_thread, args=(node, ip, int(port)))
+                timestamp_thread.start()
+                time.sleep(1)
+            else:
+                neighbor_information[node].broadcast_count += 1
+                if neighbor_information[node].broadcast_count == 10:
+                    timestamp_thread = daemon_thread_builder(target=exchange_timestamps_thread, args=(node, ip, int(port)))
+                    timestamp_thread.start()
+
+
 
 
 def tcp_server_thread():
@@ -88,7 +135,14 @@ def tcp_server_thread():
     Accept connections from other nodes and send them
     this node's timestamp once they connect.
     """
-    pass
+    server.bind(("", 0))
+    print(f"TCP Server Socket was assigned port number: {server.getsockname()[1]}")
+    server.listen(20)
+    while True:
+        client, address = server.accept()
+        timestamp = struct.pack("!d", get_timestamp())
+        client.sendto(timestamp, address)
+        client.close()
 
 
 def exchange_timestamps_thread(other_uuid: str, other_ip: str, other_tcp_port: int):
@@ -98,7 +152,19 @@ def exchange_timestamps_thread(other_uuid: str, other_ip: str, other_tcp_port: i
     Then update the neighbor_info map using other node's UUID.
     """
     print_yellow(f"ATTEMPTING TO CONNECT TO {other_uuid}")
-    pass
+    client = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        client.connect((other_ip, other_tcp_port))
+    except ConnectionRefusedError:
+        print_red("Required Node has refused the connection")
+        if other_uuid in neighbor_information.keys():
+            neighbor_information.pop(other_uuid)
+        return
+    timestamp, address = client.recvfrom(4096)
+    timestamp = struct.unpack("!d", timestamp)[0]
+    delay = (get_timestamp() - timestamp) * 1000
+    neighbor_information[other_uuid] = NeighborInfo(delay, 0, other_ip, other_tcp_port)
+    print_neighbours()
 
 
 def daemon_thread_builder(target, args=()) -> threading.Thread:
@@ -111,7 +177,17 @@ def daemon_thread_builder(target, args=()) -> threading.Thread:
 
 
 def entrypoint():
-    pass
+    server_thread = daemon_thread_builder(tcp_server_thread)
+    broadcast_thread = daemon_thread_builder(send_broadcast_thread)
+    receiver_thread = daemon_thread_builder(receive_broadcast_thread)
+
+    server_thread.start()
+    broadcast_thread.start()
+    receiver_thread.start()
+
+    broadcast_thread.join()
+    receiver_thread.join()
+    server_thread.join()
 
 ############################################
 ############################################
@@ -132,3 +208,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
